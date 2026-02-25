@@ -1,0 +1,224 @@
+#+TITLE: Elva Emacs Client - Development Plan
+#+#+DATE: 2026-02-02
+
+* Overview
+
+This document tracks the plan for building a native Emacs client for Elva
+using pycrdt (Python bindings to yrs/Rust Yjs implementation).
+
+** Architecture
+
+Web clients connect directly to Elva via WebSocket using y-protocols:
+
+#+begin_src
+┌─────────────┐
+│ Web Client  │ ──────── WebSocket (y-protocols) ─────────┐
+│   (Yjs)     │                                           │
+└─────────────┘                                           ▼
+                                                    ┌─────────┐
+┌─────────────┐                                     │  Elva   │
+│ Web Client  │ ──────── WebSocket (y-protocols) ──►│ (server)│
+│   (Yjs)     │                                     │  pycrdt │
+└─────────────┘                                     └─────────┘
+#+end_src
+
+Emacs lacks a native Yjs implementation, so we add a bridge subprocess:
+
+#+begin_src
+┌─────────────┐    JSON/stdio     ┌──────────────┐    WebSocket     ┌─────────┐
+│   Emacs     │◄─────────────────►│ elva-bridge  │◄────────────────►│  Elva   │
+│  (elva.el)  │  insert/delete    │  (pycrdt)    │   y-protocols    │ (server)│
+└─────────────┘                   └──────────────┘                  └─────────┘
+#+end_src
+
+The bridge is a per-buffer subprocess that translates between Emacs's
+position-based edits and Yjs's CRDT protocol.
+
+** Why this approach?
+
+We initially tried to bridge crdt.el (existing Emacs CRDT package) with Elva,
+but discovered fundamental incompatibilities:
+
+1. crdt.el uses its own CRDT with ID-based ordering (site-id, clock)
+2. Yjs uses a different CRDT algorithm
+3. Position-based bridging fails because the two CRDTs order content differently
+4. Proper bridging would require complex ID translation between incompatible systems
+
+The cleaner solution: use pycrdt as a subprocess that speaks native Yjs protocol.
+
+* Implementation Status
+
+** DONE Phase 1: Basic Architecture
+- [X] Design architecture (Emacs ↔ Python bridge ↔ Elva)
+- [X] Create initial elva-bridge.py skeleton
+- [X] Create initial elva.el skeleton
+
+** DONE Phase 2: Protocol Implementation
+- [X] Implement proper y-protocols sync in bridge
+  - [X] State vector exchange (SYNC_STEP1/SYNC_STEP2)
+  - [X] Update encoding/decoding (variable-length ints)
+  - [X] Initial document sync on connect
+  - [X] Incremental updates (SYNC_UPDATE)
+- [ ] Handle connection lifecycle
+  - [ ] Reconnection logic
+  - [ ] Error handling
+
+** DONE Phase 3: Elva Server Support
+- [X] Ensure Elva WebSocket endpoint works with y-protocols
+- [X] Test with elva-bridge connecting
+- [X] Handle room creation/joining
+- [X] Verified bidirectional sync: Emacs ↔ Elva editor
+
+** DONE Phase 4: Robustness
+- [X] Multi-byte character handling (UTF-8 positions vs byte positions)
+  - pycrdt uses UTF-8 byte positions, Emacs uses character positions
+  - Bridge converts between them in both directions
+- [X] Cursor position preservation during remote edits
+  - Point adjusts when edits happen before cursor
+- [X] Batch rapid local changes to reduce traffic
+  - Configurable delay (elva-batch-delay, default 50ms)
+- [X] Handle network latency gracefully
+  - Automatic reconnection with configurable attempts
+  - Connection status tracking
+
+** IN-PROGRESS Phase 5: Features
+- [X] Awareness protocol (show other users' cursors)
+  - Bridge sends/receives cursor positions via awareness protocol
+  - Emacs displays remote cursors as highlighted characters
+  - Elva TUI displays remote cursors with colored backgrounds
+  - Cursor positions adjust when edits happen (prevents "walking backward")
+  - Handles line wrapping in Elva TUI
+- [X] User identification (names, colors)
+  - Consistent color assignment per client ID
+  - User names from awareness state
+- [X] Multiple buffers/rooms
+- [ ] Offline support (queue changes, sync on reconnect)
+
+** TODO Phase 6: Distribution
+- [ ] Package for MELPA
+- [ ] Documentation
+- [ ] Installation instructions (pycrdt dependency)
+
+* Technical Notes
+
+** Position Indexing
+- Emacs uses 1-based character positions (point starts at 1)
+- pycrdt uses 0-based UTF-8 byte positions
+- Bridge converts between them:
+  - Emacs char pos → UTF-8 byte pos: encode prefix, count bytes
+  - UTF-8 byte pos → Emacs char pos: decode prefix, count chars
+  - elva.el adds/subtracts 1 for Emacs's 1-based indexing
+
+** Echo Prevention
+Both sides need to avoid re-sending changes they just received:
+- elva.el: ~elva--applying-remote~ flag
+- elva-bridge.py: ~_applying_remote~ flag
+
+** Dependencies
+- Python 3.8+
+- pycrdt: ~pip install pycrdt~
+- websockets: ~pip install websockets~
+
+** Awareness Protocol
+Cursor positions are shared via the Yjs awareness protocol:
+- Positions stored as UTF-8 byte offsets: ~{"cursor": {"anchor": pos, "head": pos}}~
+- Bridge converts byte positions to Emacs char positions
+- Stale awareness entries cleared on connect (prevents phantom cursors)
+- Disconnect message sent on shutdown (best effort)
+- Cursor positions adjusted locally when edits happen (prevents "walking backward")
+
+* Open Questions
+
+1. Should the bridge be a long-running daemon or per-buffer process?
+2. What's the right UX for conflict resolution if offline edits diverge significantly?
+
+* Future Improvements
+
+** DONE Elva Editor Connection Error Handling
+The Elva editor now properly handles connection errors:
+- [X] Show error when connection fails (wrong host/port)
+- [X] Show error when using wrong protocol (wss:// vs ws://)
+- [X] Show HTTP errors with status code and reason (e.g., "Invalid identifier")
+Note: Connection status in UI and retry logic are deferred to Phase 5.
+
+** DONE Room Listing API
+- [X] GET /rooms endpoint returns JSON list of active rooms
+- [X] Includes room identifier, client count, and persistence flag
+- [X] CLI command: ~elva rooms --host HOST --port PORT~
+
+** DONE Bridge Error Reporting
+- [X] Report HTTP errors (403 for invalid room ID) to Emacs
+- [X] Show meaningful error messages instead of "connection lost"
+
+** DONE Default Port
+- [X] Define a default port (7654) in elva.core.DEFAULT_PORT
+- [X] Server uses default port when --port not specified
+- [X] Editor/CLI clients use default port when not specified
+- [X] Emacs client has elva-default-port customization
+- [X] Makes launching server and connecting clients more predictable
+
+** TODO Emacs: List Rooms
+- [ ] Add ~elva-list-rooms~ command to query server for available rooms
+- [ ] Display rooms in a buffer (identifier, client count)
+- [ ] Allow selecting a room to connect to
+
+** TODO Emacs: Safe Room Connection
+Currently ~elva-connect~ sends buffer content to the room, which would overwrite
+existing room content. This is dangerous for joining existing rooms.
+- [X] ~elva-connect~ should open room content in a NEW buffer, not current buffer
+- [X] Add ~elva-room-from-buffer~ command to push current buffer content to a room
+- [X] Fail if room already has content when pushing buffer
+- [X] Display room name in modeline
+
+** DONE Elva Editor: Display Room Name
+- [X] Show current room identifier in the app title
+
+** DONE Server: Improved Connection Logging
+- [X] Log client IP address on connection
+- [X] Log room identifier on connection
+
+** TODO TLS Probe Noise
+- [ ] Consider suppressing or making TLS probe errors quieter on server
+
+** DONE Cursor Awareness
+- [X] Bridge: awareness protocol support (encode/decode awareness messages)
+- [X] Bridge: send cursor position updates to server
+- [X] Bridge: receive and forward cursor positions to Emacs
+- [X] Bridge: clear stale awareness on connect
+- [X] Bridge: send disconnect awareness on shutdown
+- [X] Bridge: fix position conversion for end-of-file edits
+  - Delete operations used post-mutation text for byte→char conversion
+  - Fix: store pre-change text before applying server updates
+- [X] Emacs: display remote cursors as highlighted characters
+- [X] Emacs: adjust cursor positions when edits happen
+- [X] Emacs: redraw cursors after text operations
+- [X] Emacs: clamp insert positions to valid buffer range
+- [X] Emacs: clean up process buffer leak on reconnect/disconnect
+- [X] Elva TUI: display remote cursors with colored backgrounds
+- [X] Elva TUI: adjust cursor positions when edits happen
+- [X] Elva TUI: handle line wrapping in cursor display
+- [X] Elva TUI: distinguish local vs remote edits for cursor broadcast
+
+** DONE Tests for Cursor Logic
+- [X] Bridge: byte↔char position conversion (ASCII, multibyte, clamping)
+- [X] Bridge: byte count to char count conversion
+- [X] Bridge: pre-change text mechanism for server deletes
+- [X] Bridge: delta processing (_on_text_change)
+- [X] Bridge: awareness filtering and byte→char cursor conversion
+- [X] Widget: remote cursor position adjustment after edits
+- [X] Widget: cursor change notification suppression
+- [X] Widget: byte↔char index conversion and round-trips
+- [X] Fix pre-existing test_server assertion for updated validation messages
+
+** DONE Auto-detect ws:// vs wss://
+- [X] Client: probe_tls() function to detect TLS support
+- [X] Client: safe=None (default) enables auto-detection
+- [X] Server: --ssl-cert and --ssl-key options for TLS
+- [X] Server: require TLS for non-localhost hosts
+
+* References
+
+- Yjs: https://github.com/yjs/yjs
+- pycrdt: https://github.com/jupyter-server/pycrdt
+- yrs (Rust): https://github.com/y-crdt/y-crdt
+- y-protocols: https://github.com/yjs/y-protocols
